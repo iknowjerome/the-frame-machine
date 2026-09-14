@@ -8,7 +8,7 @@ kept the fix honest. Stdlib unittest on purpose: no dev dependency to install, a
 pytest runs this file unchanged if you prefer it.
 """
 
-import os, tempfile, unittest, warnings
+import argparse, os, tempfile, unittest, warnings
 
 # Both modules derive their state paths from HOME at import time, so this has to happen
 # before the imports or the tests would read and overwrite the real ~/.config/frame.
@@ -730,6 +730,183 @@ class TestLogPath(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"the scheduled command could not run: {r.stderr}")
 
 
+class FakeArt:
+    """A stand-in Frame. `available()` returns what the TV holds; `refuse` ids fail to
+    delete, and `batch_raises` makes delete_list blow up so the per-item fallback runs."""
+
+    def __init__(self, content_ids=(), refuse=(), batch_raises=False, echo_reordered=False):
+        self.items = [{"content_id": c, "category_id": "MY-C0002" if c.upper().startswith("MY")
+                       else "MY-C0004"} for c in content_ids]
+        self.refuse, self.batch_raises, self.echo_reordered = set(refuse), batch_raises, echo_reordered
+        self.batches, self.singles = [], []
+
+    def available(self, category=None):
+        return list(self.items)
+
+    def _drop(self, cid):
+        if cid in self.refuse:
+            raise RuntimeError("cannot delete")
+        self.items = [i for i in self.items if i["content_id"] != cid]
+
+    def delete_list(self, content_ids):
+        content_ids = list(content_ids)
+        self.batches.append(content_ids)
+        if self.batch_raises:
+            raise RuntimeError("delete_image_list failed")
+        for cid in content_ids:
+            try:
+                self._drop(cid)
+            except RuntimeError:
+                pass
+        return False if self.echo_reordered else True
+
+    def delete(self, content_id):
+        self.singles.append(content_id)
+        self._drop(content_id)
+        return True
+
+
+class TestUserUploadIds(unittest.TestCase):
+    """Only art uploaded to the TV may be wiped. Samsung's own bundled pieces start SAM-
+    and cannot be re-downloaded, so they must never be selected."""
+
+    def test_samsung_art_is_excluded(self):
+        art = FakeArt(["MY_F0001", "SAM-S0011", "MY-F0002", "SAM-F0099"])
+        self.assertEqual(fp.user_upload_ids(art), ["MY_F0001", "MY-F0002"])
+
+    def test_duplicates_collapse_and_blanks_are_ignored(self):
+        art = FakeArt(["MY_F0001", "MY_F0001"])
+        art.items.append({"category_id": "MY-C0002"})          # no content_id at all
+        art.items.append(None)                                  # and a junk row
+        self.assertEqual(fp.user_upload_ids(art), ["MY_F0001"])
+
+    def test_an_empty_tv_yields_nothing(self):
+        self.assertEqual(fp.user_upload_ids(FakeArt([])), [])
+
+    def test_an_unreadable_list_is_an_error_not_a_silent_empty(self):
+        """Returning [] here would make a wipe report success having deleted nothing."""
+        class Broken:
+            def available(self, category=None):
+                raise RuntimeError("websocket closed")
+        with self.assertRaises(RuntimeError):
+            fp.user_upload_ids(Broken())
+
+
+class TestWipeUploads(unittest.TestCase):
+    def test_everything_uploaded_goes_and_samsung_art_stays(self):
+        art = FakeArt(["MY_F0001", "MY_F0002", "SAM-S0011"])
+        attempted, deleted = fp.wipe_uploads(art)
+        self.assertEqual(sorted(attempted), ["MY_F0001", "MY_F0002"])
+        self.assertEqual(sorted(deleted), ["MY_F0001", "MY_F0002"])
+        self.assertEqual([i["content_id"] for i in art.items], ["SAM-S0011"])
+
+    def test_success_is_measured_from_the_tv_not_from_delete_lists_return(self):
+        """delete_list compares the echoed payload and reports False on a reordered reply,
+        so trusting it would report a successful wipe as a total failure."""
+        art = FakeArt(["MY_F0001", "MY_F0002"], echo_reordered=True)
+        attempted, deleted = fp.wipe_uploads(art)
+        self.assertEqual(sorted(deleted), ["MY_F0001", "MY_F0002"])
+
+    def test_a_failed_batch_falls_back_to_deleting_one_at_a_time(self):
+        art = FakeArt(["MY_F0001", "MY_F0002"], batch_raises=True)
+        attempted, deleted = fp.wipe_uploads(art)
+        self.assertEqual(art.singles, ["MY_F0001", "MY_F0002"])
+        self.assertEqual(sorted(deleted), ["MY_F0001", "MY_F0002"])
+
+    def test_one_undeletable_image_does_not_strand_the_rest(self):
+        art = FakeArt(["MY_F0001", "MY_F0002", "MY_F0003"],
+                      refuse=["MY_F0002"], batch_raises=True)
+        attempted, deleted = fp.wipe_uploads(art)
+        self.assertEqual(sorted(attempted), ["MY_F0001", "MY_F0002", "MY_F0003"])
+        self.assertEqual(sorted(deleted), ["MY_F0001", "MY_F0003"])
+        self.assertIn("MY_F0002", [i["content_id"] for i in art.items])
+
+    def test_large_collections_are_deleted_in_batches(self):
+        art = FakeArt([f"MY_F{n:04d}" for n in range(45)])
+        fp.wipe_uploads(art, batch=20)
+        self.assertEqual([len(b) for b in art.batches], [20, 20, 5])
+
+    def test_an_empty_tv_deletes_nothing(self):
+        art = FakeArt([])
+        self.assertEqual(fp.wipe_uploads(art), ([], []))
+        self.assertEqual(art.batches, [])
+
+
+class TestDoWipe(TempState):
+    """The --wipe entry point: what it prints, and what local state it may touch."""
+
+    def setUp(self):
+        super().setUp()
+        self.art = FakeArt(["MY_F0001", "MY_F0002", "SAM-S0011"])
+        real_locate, real_open = fp.locate_frame, fp.open_art
+        fp.locate_frame = lambda a: "192.168.4.64"
+        fp.open_art = lambda a, ip: self.art
+        self.addCleanup(lambda: (setattr(fp, "locate_frame", real_locate),
+                                 setattr(fp, "open_art", real_open)))
+        self.args = argparse.Namespace(mac="a0:d0:5b:a0:e9:89", ip=None, token_file=None,
+                                       timeout=30, no_wake=True, wake_wait=1, retries=1,
+                                       dry_run=False, wipe=True)
+
+    def _run(self):
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fp.do_wipe(self.args)
+        return buf.getvalue()
+
+    def test_dry_run_counts_and_deletes_nothing(self):
+        self.args.dry_run = True
+        out = self._run()
+        self.assertIn("uploads: 2", out)
+        self.assertEqual(len(self.art.items), 3, "a dry run deleted something")
+
+    def test_the_count_line_is_machine_readable_for_the_panel(self):
+        """The panel parses this exact line to name the number before deleting."""
+        self.args.dry_run = True
+        self.assertRegex(self._run(), r"(?m)^uploads:\s*2$")
+
+    def test_a_real_wipe_deletes_and_reports(self):
+        out = self._run()
+        self.assertIn("Wiped 2 image(s)", out)
+        self.assertEqual([i["content_id"] for i in self.art.items], ["SAM-S0011"])
+
+    def test_stale_local_state_is_cleared_but_history_and_favourites_survive(self):
+        """History images and favourites are local files — browsing back re-uploads one, so
+        they keep working after a wipe and must not be destroyed with it."""
+        os.makedirs(fp.HIST_IMG_DIR, exist_ok=True)
+        os.makedirs(fp.FAVS_DIR, exist_ok=True)
+        with open(fp.STATE, "w") as f:
+            f.write('["MY_F0001"]')
+        with open(fp.CURRENT_IMG, "wb") as f:
+            f.write(b"x")
+        fp._save_list(fp.HISTORY, [{"id": "met:1", "title": "X", "file": "/tmp/x.jpg"}])
+        fp._save_list(fp.FAVOURITES, [{"id": "met:1", "file": "/tmp/x.jpg"}])
+        self._run()
+        self.assertFalse(os.path.exists(fp.STATE), "the stale uploaded-id list was kept")
+        self.assertFalse(os.path.exists(fp.CURRENT_IMG), "a thumbnail of nothing was kept")
+        self.assertEqual(len(fp._load_list(fp.HISTORY)), 1, "history was destroyed")
+        self.assertEqual(len(fp._load_list(fp.FAVOURITES)), 1, "favourites were destroyed")
+
+    def test_the_outcome_is_recorded_for_the_panel(self):
+        self._run()
+        st = fp.read_status()
+        self.assertTrue(st["ok"])
+        self.assertIn("Wiped 2", st["message"])
+
+    def test_an_unreachable_tv_fails_instead_of_handing_off_to_a_watcher(self):
+        """A wipe is a deliberate, immediate action — it must never be queued for later."""
+        fp.locate_frame = lambda a: None
+        with self.assertRaises(RuntimeError) as e:
+            self._run()
+        self.assertIn("not found on the network", str(e.exception))
+
+    def test_nothing_to_wipe_is_not_an_error(self):
+        self.art = FakeArt(["SAM-S0011"])
+        out = self._run()
+        self.assertIn("uploads: 0", out)
+        self.assertIn("Nothing to wipe", out)
+
+
 # ------------------------------------------------------------------------- the panel
 SERVICE_COMMANDS = ("crontab", "launchctl")
 
@@ -918,6 +1095,100 @@ class TestPanelRoutes(TempState):
             self.assertIsNotNone(r.get_json().get("message"))
         finally:
             app.save_config({"password": ""})
+
+    def test_wipe_without_confirm_only_counts(self):
+        """The first tap must never delete: it exists so the page can name the number."""
+        app.save_config({"mac": "a0:d0:5b:a0:e9:89"})
+        calls = []
+
+        class Done:
+            returncode, stdout, stderr = 0, "uploads: 7\n", ""
+        real = app.run_push
+        app.run_push = lambda extra, t, w: (calls.append(extra), (Done(), None))[1]
+        try:
+            j = self.client.post("/wipe", json={}).get_json()
+        finally:
+            app.run_push = real
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["count"], 7)
+        self.assertTrue(j["armed"])
+        self.assertIn("--dry-run", calls[0], "the counting call was not a dry run")
+
+    def test_wipe_with_confirm_deletes(self):
+        app.save_config({"mac": "a0:d0:5b:a0:e9:89"})
+        calls = []
+
+        class Done:
+            returncode = 0
+            stdout = "uploads: 7\ndeleted: 7 of 7\nWiped 7 image(s) from the TV.\n"
+            stderr = ""
+        real = app.run_push
+        app.run_push = lambda extra, t, w: (calls.append(extra), (Done(), None))[1]
+        try:
+            j = self.client.post("/wipe", json={"confirm": True}).get_json()
+        finally:
+            app.run_push = real
+        self.assertTrue(j["ok"])
+        self.assertNotIn("--dry-run", calls[0])
+        self.assertIn("Wiped 7", j["message"])
+
+    def test_wipe_passes_only_the_mac_not_the_art_settings(self):
+        """Sending flags_from() here would let an unrelated setting steer a destructive call."""
+        app.save_config({"mac": "a0:d0:5b:a0:e9:89"})
+        calls = []
+
+        class Done:
+            returncode, stdout, stderr = 0, "uploads: 0\n", ""
+        real = app.run_push
+        app.run_push = lambda extra, t, w: (calls.append(extra), (Done(), None))[1]
+        try:
+            self.client.post("/wipe", json={"confirm": True})
+        finally:
+            app.run_push = real
+        self.assertEqual(calls[0], ["--wipe", "--mac", "a0:d0:5b:a0:e9:89"])
+
+    def test_wipe_refuses_without_a_mac(self):
+        app.save_config({"mac": ""})
+        ran = []
+        real = app.run_push
+        app.run_push = lambda *a, **k: ran.append(a) or (None, "should not run")
+        try:
+            j = self.client.post("/wipe", json={"confirm": True}).get_json()
+        finally:
+            app.run_push = real
+        self.assertFalse(j["ok"])
+        self.assertEqual(ran, [], "it tried to wipe with no TV configured")
+
+    def test_wipe_reports_a_failed_run_rather_than_claiming_success(self):
+        app.save_config({"mac": "a0:d0:5b:a0:e9:89"})
+
+        class Failed:
+            returncode, stdout, stderr = 1, "", "FAILED: Frame not found on the network."
+        real = app.run_push
+        app.run_push = lambda *a, **k: (Failed(), None)
+        try:
+            j = self.client.post("/wipe", json={"confirm": True}).get_json()
+        finally:
+            app.run_push = real
+        self.assertFalse(j["ok"])
+        self.assertIn("not found", j["message"])
+
+    def test_wipe_surfaces_a_timeout_as_a_message(self):
+        app.save_config({"mac": "a0:d0:5b:a0:e9:89"})
+        real = app.run_push
+        app.run_push = lambda *a, **k: (None, "Wiping the TV took longer than 300s and was stopped.")
+        try:
+            j = self.client.post("/wipe", json={"confirm": True}).get_json()
+        finally:
+            app.run_push = real
+        self.assertFalse(j["ok"])
+        self.assertIn("took longer", j["message"])
+
+    def test_the_page_carries_a_two_step_wipe_button(self):
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn('id="wipe"', page)
+        self.assertIn("Tap again to confirm", page)
+        self.assertIn("body:JSON.stringify({confirm})", page)
 
     def test_history_entries_are_escaped_into_the_page(self):
         """Bug: museum-supplied title and url went into innerHTML raw."""

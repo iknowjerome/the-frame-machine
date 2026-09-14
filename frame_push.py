@@ -589,6 +589,115 @@ def _watch_loop(args):
         except Exception:
             pass
 
+# ---------- talking to the TV ----------
+def locate_frame(args):
+    """The Frame's IP, or None if it simply isn't answering. Raises with the fix when the
+    machine is missing the commands discovery needs — no amount of retrying helps there."""
+    if not args.mac:
+        raise RuntimeError("No TV MAC set. Pass --mac AA:BB:CC:DD:EE:FF, or set FRAME_MAC in "
+                           "the environment. Find it on the Frame under About This TV, or your router.")
+    print("Locating the Frame...")
+    ip = resolve_frame_ip(args.ip, args.mac)
+    if ip:
+        print(f"Frame at {ip}")
+        return ip
+    missing = _net_tools_missing()
+    if missing:
+        raise RuntimeError(
+            f"Can't locate the Frame: this machine has no {' or '.join(missing)} command, "
+            "which is how a MAC address is mapped to an IP. Install it (Debian/Ubuntu: "
+            f"sudo apt install {' '.join(APT_FOR[t] for t in missing)}).")
+    return None
+
+def open_art(args, ip):
+    from samsungtvws import SamsungTVWS
+    return SamsungTVWS(host=ip, port=8002, token_file=args.token_file, timeout=args.timeout).art()
+
+# ---------- wiping the TV's uploaded images ----------
+# The Frame files everything uploaded to it under "My Photos", and those content ids start
+# with MY (e.g. MY_F2205). Samsung's own bundled and store pieces start SAM- and are left
+# alone on purpose: they can't be re-downloaded once removed.
+UPLOAD_ID_PREFIX = "MY"
+
+def user_upload_ids(art):
+    """Content ids of every uploaded image on the TV, Samsung's own art excluded."""
+    try:
+        items = art.available() or []
+    except Exception as e:
+        raise RuntimeError(f"Couldn't read the TV's image list: {str(e)[:120]}")
+    ids = []
+    for it in items:
+        cid = str((it or {}).get("content_id") or "")
+        if cid.upper().startswith(UPLOAD_ID_PREFIX) and cid not in ids:
+            ids.append(cid)
+    return ids
+
+def wipe_uploads(art, batch=20):
+    """Delete every uploaded image from the TV. Returns (attempted_ids, deleted_ids).
+
+    What actually went is confirmed by re-reading the TV's list rather than trusting
+    delete_list's return value: that compares the echoed payload to what was sent and
+    reports False whenever the TV replies in a different order, which would understate
+    a deletion that did happen."""
+    attempted = user_upload_ids(art)
+    if not attempted:
+        return [], []
+    for i in range(0, len(attempted), batch):
+        chunk = attempted[i:i + batch]
+        try:
+            art.delete_list(chunk)
+        except Exception as e:
+            print(f"  ! batch delete failed ({str(e)[:80]}) — falling back to one at a time",
+                  file=sys.stderr)
+            for cid in chunk:                    # one bad id must not strand the rest
+                try:
+                    art.delete(cid)
+                except Exception as e2:
+                    print(f"  ! {cid}: {str(e2)[:80]}", file=sys.stderr)
+    left = set(user_upload_ids(art))
+    return attempted, [cid for cid in attempted if cid not in left]
+
+def do_wipe(args):
+    """--wipe: remove every uploaded image from the TV. Irreversible."""
+    ip = locate_frame(args)
+    if not ip:                                   # a wipe is a deliberate, immediate action:
+        raise RuntimeError(                      # never hand it to a background watcher
+            f"Frame (MAC {args.mac}) not found on the network. Wake the TV and try again.")
+    os.makedirs(CFG, exist_ok=True)
+    art = open_art(args, ip)
+    if not args.no_wake:
+        print("Waking the Frame and waiting for the art channel...")
+        ensure_art_ready(art, args.mac, args.wake_wait, args.retries)
+        print("Art channel is up.")
+
+    ids = user_upload_ids(art)
+    print(f"uploads: {len(ids)}")                # machine-readable; the panel parses this
+    if args.dry_run:
+        return
+    if not ids:
+        print("Nothing to wipe — the TV has no uploaded images.")
+        return
+    print(f"Deleting {len(ids)} uploaded image(s)...")
+    attempted, deleted = wipe_uploads(art)
+    print(f"deleted: {len(deleted)} of {len(attempted)}")
+
+    # Local state that named those ids is now stale. History and favourites are kept: they
+    # are local image files, and browsing back re-uploads one, so they still work.
+    try:
+        if os.path.exists(STATE):
+            os.remove(STATE)                     # the "previous batch" to prune no longer exists
+        if os.path.exists(CURRENT_IMG):
+            os.remove(CURRENT_IMG)               # nothing of ours is on the TV to show a thumb of
+    except Exception as e:
+        print(f"  ! couldn't clear local state: {str(e)[:80]}", file=sys.stderr)
+
+    missed = len(attempted) - len(deleted)
+    msg = f"Wiped {len(deleted)} image(s) from the TV."
+    if missed:
+        msg += f" {missed} could not be deleted."
+    write_status(bool(deleted) or not attempted, msg)
+    print(msg)
+
 # ---------- image prep ----------
 def slug(s, n=50):
     s = re.sub(r"[^\w\s-]", "", s).strip().lower()
@@ -1317,6 +1426,8 @@ def _gather(args, mat_rgb, count):
 def run(args):
     if getattr(args, "watch", False):                     # watcher mode: wait for the TV, then push
         return _watch_loop(args)
+    if getattr(args, "wipe", False):                      # destructive; renders and pushes nothing
+        return do_wipe(args)
     mat_rgb = MAT_COLORS[args.mat]
     if getattr(args, "tone_weights", None) is not None:   # live weights from the panel override config's
         global _TONE_WEIGHTS
@@ -1341,24 +1452,12 @@ def run(args):
         keep = {k: v for k, v in read_status().items() if k not in ("ok", "when", "message")}
         write_status(True, "Kept — art left unchanged", keep)
         return
-    if not args.mac:
-        raise RuntimeError("No TV MAC set. Pass --mac AA:BB:CC:DD:EE:FF, or set FRAME_MAC in "
-                           "the environment. Find it on the Frame under About This TV, or your router.")
-    print("Locating the Frame...")
-    ip = resolve_frame_ip(args.ip, args.mac)
+    ip = locate_frame(args)
     if not ip:
-        missing = _net_tools_missing()
-        if missing:                          # no amount of waiting will conjure up the command
-            raise RuntimeError(
-                f"Can't locate the Frame: this machine has no {' or '.join(missing)} command, "
-                "which is how a MAC address is mapped to an IP. Install it (Debian/Ubuntu: "
-                f"sudo apt install {' '.join(APT_FOR[t] for t in missing)}).")
         return _maybe_watch(args, f"Frame (MAC {args.mac}) not found on the network.")
-    print(f"Frame at {ip}")
 
     os.makedirs(CFG, exist_ok=True)
-    from samsungtvws import SamsungTVWS
-    art = SamsungTVWS(host=ip, port=8002, token_file=args.token_file, timeout=args.timeout).art()
+    art = open_art(args, ip)
 
     if not args.no_wake:
         print("Waking the Frame and waiting for the art channel...")
@@ -1556,6 +1655,11 @@ def main():
     ap.add_argument("--retries", type=int, default=4, help="wake+probe attempts (the watcher is more patient still)")
     ap.add_argument("--no-wake", action="store_true", help="skip the WoL/wake step")
     ap.add_argument("--upload-retries", type=int, default=3, help="retries per image on transient errors")
+    ap.add_argument("--wipe", action="store_true",
+                    help="DELETE every uploaded image from the TV and exit. Irreversible. "
+                         "Samsung's own bundled art is left alone")
+    ap.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="with --wipe, only count what would be deleted")
     ap.add_argument("--watch", action="store_true",
                     help="poll until the TV's art channel is up, then push (used by auto-retry)")
     ap.add_argument("--watch-on-fail", dest="watch_on_fail", action=argparse.BooleanOptionalAction,
