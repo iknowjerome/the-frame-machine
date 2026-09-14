@@ -11,7 +11,7 @@ for its defaults) and, on macOS, manages the launchd schedule from the frequency
 you pick. Run it with:  python3 app.py   (add --port 8080 to change the port)
 """
 
-import argparse, json, os, platform, shutil, subprocess, sys, tempfile, threading, time
+import argparse, json, os, platform, re, shutil, subprocess, sys, tempfile, threading, time
 import secrets
 from flask import Flask, request, jsonify, send_file, render_template_string, session, redirect
 
@@ -441,6 +441,45 @@ def drop_voice():
     save_config({"tone": [t for t in tones if t != style], "tone_weights": weights})
     return jsonify(ok=True, dropped=style, message=f"Dropped “{style}” — it won't be used again.")
 
+WIPE_COUNT = re.compile(r"^uploads:\s*(\d+)\s*$", re.M)
+
+
+@app.route("/wipe", methods=["POST"])
+def wipe():
+    """Count, or delete, every uploaded image on the TV.
+
+    Two steps on purpose: the first call only counts, so the page can name the number
+    before anything is destroyed, and nothing is deleted without `confirm`. Only the MAC
+    is passed through — the art settings are irrelevant here and sending them would let a
+    stray flag change what gets deleted."""
+    body = request.get_json(silent=True) or {}
+    cfg = fp.load_config()
+    if not cfg.get("mac"):
+        return jsonify(ok=False, message="No TV MAC set — add it under Advanced first.")
+    base = ["--wipe", "--mac", cfg["mac"]]
+    confirmed = bool(body.get("confirm"))
+
+    r, err = run_push(base if confirmed else base + ["--dry-run"],
+                      300 if confirmed else 120,
+                      "Wiping the TV" if confirmed else "Counting the TV's images")
+    if err:
+        return jsonify(ok=False, message=err)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        return jsonify(ok=False, message=(r.stderr or r.stdout or "failed").strip()[-300:])
+
+    m = WIPE_COUNT.search(out)
+    count = int(m.group(1)) if m else None
+    if not confirmed:
+        if count == 0:
+            return jsonify(ok=True, count=0, message="The TV has no uploaded images to wipe.")
+        return jsonify(ok=True, count=count, armed=True,
+                       message=f"{count} uploaded image(s) on the TV.")
+    tail = [l for l in out.splitlines() if l.startswith("Wiped") or l.startswith("Nothing to wipe")]
+    return jsonify(ok=True, count=0,
+                   message=tail[-1] if tail else "Wipe finished.")
+
+
 @app.route("/favourite", methods=["POST"])
 def favourite():
     st = _read_status()
@@ -666,6 +705,9 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <div><input type="number" step="any" id="longitude" placeholder="longitude" style="width:100%;background:#303033;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px"></div>
  </div>
  <p class="sub" style="margin-top:8px">Leave blank to auto-detect from your internet connection. Set them for a precise local forecast.</p>
+ <label class="f" style="margin-top:16px">Wipe the TV <span class="sub">— remove every image this app has uploaded</span></label>
+ <button id="wipe" style="width:100%;margin-top:8px;padding:13px;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;border:1px solid #8a4a4a;background:#5a2d2d;color:#f3d6d6">Wipe all uploaded images from the TV</button>
+ <p class="sub" id="wipehint" style="margin-top:8px">Deletes the art this app has put on the Frame. Samsung's own built-in art is left alone. This can't be undone — your saved favourites and history stay on this machine, so you can put them back.</p>
  <label class="f" style="margin-top:16px">Panel password</label>
  <input type="password" id="password" placeholder="leave blank to keep current" autocomplete="new-password" style="width:100%;background:#303033;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px">
  <p class="sub" style="margin-top:8px">Requires a login to open this panel. Blank leaves it unchanged; to remove it, clear it in config.json.</p>
@@ -688,7 +730,8 @@ const el = {content:$('content'), source:$('source'), all_types:$('all_types'), 
   cur:$('cur'), laststatus:$('laststatus'), nowtitle:$('nowtitle'), nowmeta:$('nowmeta'),
   nowdetails:$('nowdetails'), nowcaption:$('nowcaption'), nowlink:$('nowlink'),
   nowstyle:$('nowstyle'), dropvoice:$('dropvoice'), stopwatch:$('stopwatch'), filewarn:$('filewarn'),
-  pin:$('pin'), ban:$('ban'), fav:$('fav'), nowtop:$('nowtop'), back:$('back'), fwd:$('fwd')};
+  pin:$('pin'), ban:$('ban'), fav:$('fav'), nowtop:$('nowtop'), back:$('back'), fwd:$('fwd'),
+  wipe:$('wipe'), wipehint:$('wipehint')};
 function setSeg(val){document.querySelectorAll('#description button').forEach(b=>b.classList.toggle('on',b.dataset.v===val));
   el.tonerow.style.display = (val==='made-up') ? 'block' : 'none';}
 document.querySelectorAll('#description button').forEach(b=>b.onclick=()=>setSeg(b.dataset.v));
@@ -835,6 +878,24 @@ el.stopwatch.onclick=async()=>{const j=await readJson(await fetch('/stop-watch',
 el.dropvoice.onclick=async()=>{const j=await readJson(await fetch('/drop-voice',{method:'POST'}));el.status.textContent=j.message;
   if(j.ok&&j.dropped){const row=voiceRow(j.dropped);if(row)setVoice(row,0);}
   loadState();};
+// Wiping is destructive and irreversible, so the first tap only COUNTS: the button then
+// names the number and arms for a few seconds, and nothing is deleted without a second tap.
+(function(){const LABEL='Wipe all uploaded images from the TV'; let armed=0, timer=null;
+  function disarm(){armed=0; clearTimeout(timer); el.wipe.textContent=LABEL;}
+  el.wipe.onclick=async()=>{
+    const confirm = armed && Date.now() < armed;
+    el.wipe.disabled=true; const old=el.wipe.textContent;
+    el.wipe.innerHTML='<span class="spin"></span>'+(confirm?'Wiping':'Checking')+'…';
+    let j;
+    try{ j = await readJson(await fetch('/wipe',{method:'POST',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm})})); }
+    catch(e){ j={ok:false,message:'Error: '+e}; }
+    el.wipe.disabled=false; el.status.textContent=j.message||'';
+    if(confirm || !j.ok || !j.armed){ disarm(); if(confirm) loadState(); return; }
+    armed = Date.now()+8000;                      // a stale confirmation shouldn't stay live
+    el.wipe.textContent='Delete '+j.count+' image(s)? Tap again to confirm';
+    timer = setTimeout(disarm, 8000);
+  };})();
 loadState();
 </script></body></html>"""
 
