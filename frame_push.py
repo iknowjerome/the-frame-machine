@@ -1445,6 +1445,35 @@ def run(args):
         print(f"Preview written: {args.preview}")
         return
 
+    # Batch preview: prepare the requested batch locally and stop.
+    if args.preview_dir:
+        os.makedirs(CFG, exist_ok=True)
+        os.makedirs(args.preview_dir, exist_ok=True)
+
+        paths = _gather(args, mat_rgb, args.fetch)
+        if not paths:
+            raise RuntimeError("No images to preview.")
+
+        import shutil
+
+        for name in os.listdir(args.preview_dir):
+            if name.lower().endswith((".jpg", ".jpeg")):
+                try:
+                    os.remove(os.path.join(args.preview_dir, name))
+                except OSError:
+                    pass
+
+        for i, src in enumerate(paths, 1):
+            dst = os.path.join(args.preview_dir, f"{i:02d}.jpg")
+            shutil.copy(src, dst)
+            print(f"  preview {i:02d}: {dst}")
+
+        print(
+            f"Preview batch written: {args.preview_dir} "
+            f"({len(paths)} image(s))"
+        )
+        return
+
     if load_config().get("pinned") and not args.force and not args.files:
         print("Kept — leaving the current art in place.")
         # Nothing was prepped on this path, so LAST_PIECES is empty — carry the recorded piece
@@ -1657,6 +1686,13 @@ def main():
                          "face-ish, 1 = only clear faces with findable eyes)")
     ap.add_argument("--preview", default=None, metavar="PATH",
                     help="render one image to PATH and exit — does not touch the TV")
+    ap.add_argument(
+        "--preview-dir",
+        dest="preview_dir",
+        default=None,
+        metavar="DIR",
+        help="render the requested batch into DIR and stop without touching the TV",
+    )
     ap.add_argument("--force", action="store_true", help="change the art even if pinned")
     ap.add_argument("--no-record", action="store_true",
                     help="display without adding to history (used when browsing back/forward)")
