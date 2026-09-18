@@ -15,4 +15,4 @@ COPY frame_push.py app.py ./
 
 EXPOSE 8080
 # The control panel, with cron running beside it so a saved schedule actually fires.
-CMD ["sh", "-c", "cron && exec python app.py --port 8080"]
+CMD ["sh", "-c", "cron && exec python app.py --port 8081"]

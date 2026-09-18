@@ -16,6 +16,7 @@ Examples:
 import argparse, io, os, re, json, math, random, shutil, socket, subprocess, sys, time, warnings, datetime, html, platform
 import requests
 from PIL import Image, ImageDraw, ImageFont
+from samsungtvws import SamsungTVWS
 try:
     from wakeonlan import send_magic_packet
 except Exception:
@@ -1497,22 +1498,43 @@ def run(args):
 
     print(f"Uploading {len(paths)} image(s)...")
     ids = []
+
     for p in paths:
         data = open(p, "rb").read()
+
         for attempt in range(1, args.upload_retries + 1):
+            art = None
+
             try:
-                cid = art.upload(data, file_type="JPEG", matte="none")
+                art = fresh_art()
+
+                cid = art.upload(
+                    data,
+                    file_type="JPEG",
+                    matte="none",
+                )
+
                 ids.append(cid)
                 print(f"  uploaded {os.path.basename(p)} -> {cid}")
                 break
+
             except Exception as e:
-                print(f"  ! upload retry {attempt}/{args.upload_retries} for {os.path.basename(p)}: {str(e)[:120]}", file=sys.stderr)
-                time.sleep(2)
-                try:
-                    art = fresh_art()
-                except Exception:
-                    pass
-        time.sleep(0.5)
+                print(
+                    f"  ! upload retry {attempt}/{args.upload_retries} "
+                    f"for {os.path.basename(p)}: {str(e)[:120]}",
+                    file=sys.stderr,
+                )
+
+                time.sleep(3)
+
+            finally:
+                if art is not None:
+                    try:
+                        art.close()
+                    except Exception:
+                        pass
+
+        time.sleep(2)
     if not ids:
         raise RuntimeError("All uploads failed (intermittent art-channel errors). Try re-running.")
 

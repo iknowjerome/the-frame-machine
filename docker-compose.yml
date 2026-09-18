@@ -6,6 +6,8 @@ services:
   frame-machine:
     build: .
     network_mode: host          # required for TV discovery + Wake-on-LAN
+    dns:
+      - 10.0.0.243
     environment:
       - FRAME_MAC=${FRAME_MAC:-}
       - PYTHONUNBUFFERED=1
