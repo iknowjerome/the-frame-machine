@@ -6,6 +6,10 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 ## [Unreleased]
 
 ### Added
+- **Wikimedia Commons featured photographs as a source** (`--source commons`, panel "Source").
+  Curated photography, keyless. Only files licensed CC0, public domain, CC BY or CC BY-SA are
+  used, and the author and licence appear on the placard. Opt-in: `--source any` still rotates
+  through the three museums only.
 - **Art Institute of Chicago as a third source** (`--source artic`, also part of `any`).
   Public-domain works only, with the museum's own description as the "real" caption. It was
   dropped in 2026-06 when its image host began answering 403; the host wants an
@@ -14,6 +18,7 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
   later, for all three museums.
 
 ### Fixed
+- Descriptions with inline markup no longer gain stray spaces ("the Yukon ." -> "the Yukon.").
 - **No more blurry blow-ups.** Some museum "original" scans are tiny (one was 750px
   wide) and were being enlarged 4-5x to fill a 4K screen. Any picture that would need
   enlarging more than 1.6x in the current layout is now skipped (`--max-upscale`,

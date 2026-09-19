@@ -1284,7 +1284,8 @@ class TestArtInstituteOfChicago(unittest.TestCase):
         self.assertEqual(fp._aic_artist({"artist_title": None, "artist_display": None}), ("", ""))
 
     def test_descriptions_arrive_as_html_and_leave_as_text(self):
-        self.assertEqual(fp._strip_html("<p>In <em>Ferris</em> &amp; friends.</p>").split(), ["In", "Ferris", "&", "friends."])
+        self.assertEqual(fp._strip_html("<p>In <em>Ferris</em> &amp; friends.</p>").strip(), "In Ferris & friends.")
+        self.assertEqual(fp._strip_html("a<br>b").split(), ["a", "b"])            # block tags still separate words
         self.assertEqual(fp._strip_html(None), "")
 
     def test_any_source_includes_it_and_every_source_has_a_label(self):
@@ -1304,6 +1305,93 @@ class TestEraFilter(unittest.TestCase):
     def test_the_panel_sends_era_and_the_pusher_accepts_it(self):
         flags = app.flags_from(dict(fp.DEFAULTS, mac="a0:d0:5b:01:23:56", era="modern"))
         self.assertEqual(flags[flags.index("--era") + 1], "modern")
+
+
+class TestWikimediaCommons(unittest.TestCase):
+    """Fourth source: featured photographs. Licences are per-file, so the tests pin down what
+    is accepted and what ends up on the placard."""
+
+    @staticmethod
+    def page(**over):
+        info = {"mime": "image/jpeg", "width": 5815, "height": 3877, "thumbwidth": 3840, "thumbheight": 2560,
+                "thumburl": "https://thumb.example/x.jpg", "url": "https://upload.example/x.jpg",
+                "descriptionurl": "https://commons.wikimedia.org/wiki/File:X.jpg",
+                "extmetadata": {
+                    "ObjectName": {"value": "Bennett Lake"},
+                    "Artist": {"value": '<a href="//c/User:J" title="User:J">Jakub Fryš</a>'},
+                    "LicenseShortName": {"value": "CC BY-SA 4.0"},
+                    "DateTimeOriginal": {"value": "Taken on\u00a022 July 2018, 17:46:10"},
+                    "ImageDescription": {"value": "<p>From the <b>Yukon</b>.</p>"}}}
+        info.update(over)
+        return {"pageid": 42, "title": "File:Bennett_Lake.jpg", "imageinfo": [info]}
+
+    def test_a_usable_page_becomes_placard_fields(self):
+        c = fp._commons_piece(self.page())
+        self.assertEqual((c["title"], c["artist"], c["licence"]), ("Bennett Lake", "Jakub Fryš", "CC BY-SA 4.0"))
+        self.assertEqual(c["date"], "22 July 2018")                       # the time of day is dropped
+        self.assertEqual(c["description"], "From the Yukon.")
+        self.assertEqual((c["img_url"], c["w"], c["h"]), ("https://thumb.example/x.jpg", 3840, 2560))
+
+    def test_only_licences_a_placard_can_honour_are_used(self):
+        for ok in ("CC0", "CC BY 4.0", "CC BY-SA 2.0", "Public domain", "PD-USGov"):
+            self.assertTrue(fp._commons_licence_ok(ok), ok)
+        for bad in ("", None, "GFDL", "All rights reserved", "Fair use", "CC BY-NC 4.0", "CC BY-ND 2.0", "CC BY-NC-SA 3.0"):
+            with self.subTest(licence=bad):
+                self.assertFalse(fp._commons_licence_ok(bad))
+        p = self.page(); p["imageinfo"][0]["extmetadata"]["LicenseShortName"]["value"] = "GFDL"
+        self.assertIsNone(fp._commons_piece(p))
+
+    def test_non_jpegs_are_skipped(self):
+        self.assertIsNone(fp._commons_piece(self.page(mime="image/svg+xml")))
+        self.assertIsNone(fp._commons_piece({"pageid": 1, "title": "File:x.jpg"}))       # no image info at all
+
+    def test_the_author_is_the_link_text_not_the_boilerplate(self):
+        html = 'This Photo was taken by <a href="//c/U">Timothy A. Gonsalves</a>. Feel free to use my photos, but please credit me.'
+        self.assertEqual(fp._commons_author(html), "Timothy A. Gonsalves")
+        self.assertEqual(fp._commons_author("Some Plain Name"), "Some Plain Name")
+        self.assertEqual(fp._commons_author("Unknown author"), "")
+        p = self.page(); p["imageinfo"][0]["extmetadata"]["Artist"]["value"] = "R_M_S_Mulheim_wreck_448.jpg"
+        self.assertEqual(fp._commons_piece(p)["artist"], "", "a file name is not an author")
+        self.assertLessEqual(len(fp._commons_author("word " * 40)), 62)
+
+    def test_wikidata_debris_and_overlong_titles_are_cleaned(self):
+        """Bug caught on a real file: the title was 'Among the Sierra Nevada, California title
+        QS:P1476,en:"…" label QS:Lur,…' — a wall of text that would run off the placard."""
+        junk = 'Among the Sierra Nevada, California title QS:P1476,en:"Among the Sierra Nevada" label QS:Lde,"In der Sierra"'
+        self.assertEqual(fp._commons_title(junk), "Among the Sierra Nevada, California")
+        self.assertEqual(fp._commons_title("Plain title"), "Plain title")
+        long = fp._commons_title("word " * 60)
+        self.assertLessEqual(len(long), 111)
+        self.assertTrue(long.endswith("…"))
+
+    def test_a_missing_title_falls_back_to_the_file_name(self):
+        p = self.page(); p["imageinfo"][0]["extmetadata"].pop("ObjectName")
+        self.assertEqual(fp._commons_piece(p)["title"], "Bennett Lake")
+
+    def test_search_is_restricted_to_the_featured_category(self):
+        p = fp._commons_params('moun"tain', offset=100)
+        self.assertEqual(p["generator"], "search")
+        self.assertIn('incategory:"Featured pictures on Wikimedia Commons"', p["gsrsearch"])
+        self.assertNotIn('"tain', p["gsrsearch"], "a stray quote would break out of the search phrase")
+        self.assertEqual(p["gsroffset"], "100")
+
+    def test_without_a_search_it_lists_the_category_from_a_random_title_prefix(self):
+        """Bug caught live: starting from a random 'date added' put 25 of 30 runs on the same file,
+        because those timestamps are clustered by bulk re-tagging. Title prefixes spread evenly."""
+        prefix = fp._commons_prefix()
+        p = fp._commons_params(None, prefix=prefix)
+        self.assertEqual((p["generator"], p["gcmsort"], p["gcmstartsortkeyprefix"]), ("categorymembers", "sortkey", prefix))
+        self.assertNotIn("gcmstart", p)
+        self.assertRegex(prefix, r"^[A-Z]{2}$")
+        self.assertGreater(len({fp._commons_prefix() for _ in range(200)}), 50, "prefixes should vary")
+
+    def test_thumbnails_use_a_standard_width_or_wikimedia_rate_limits_them(self):
+        self.assertEqual(fp.COMMONS_WIDTH, 3840)
+
+    def test_photographs_are_opt_in_not_part_of_any(self):
+        self.assertIn("commons", fp.SOURCES)
+        self.assertNotIn("commons", fp.MUSEUMS)
+        self.assertEqual(set(fp.SOURCES), set(fp.SOURCE_LABELS))
 
 
 class TestShippedExamples(unittest.TestCase):

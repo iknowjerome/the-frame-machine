@@ -13,7 +13,7 @@ Examples:
     python3 frame_push.py --preview /tmp/out.jpg --no-placard      # render only, don't touch the TV
 """
 
-import argparse, io, os, re, json, math, random, shutil, socket, subprocess, sys, time, warnings, datetime, html, platform
+import argparse, io, os, re, string, json, math, random, shutil, socket, subprocess, sys, time, warnings, datetime, html, platform
 import requests
 from PIL import Image, ImageDraw, ImageFont
 from samsungtvws import SamsungTVWS
@@ -1404,7 +1404,10 @@ def _aic_artist(o):
     return name, bio
 
 def _strip_html(text):
-    return html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    """HTML -> text. Block tags (paragraphs, breaks) become spaces; inline ones (<b>, <em>, <a>)
+    vanish, or 'the <b>Yukon</b>.' would read 'the Yukon .'"""
+    text = re.sub(r"</?(?:p|br|div|li|ul|ol|h\d|tr|td)\b[^>]*>", " ", text or "", flags=re.I)
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 def fetch_artic(count, query, mat_rgb, theme=None, placard=False, describe="off", types=None, qr=True, tone="whimsical", avoid=None, seasonal=False, hemisphere="north", all_types=True, subject="", holidays=False, weather=False, on_this_day=False, latitude=None, longitude=None, googly_chance=0.0, googly_strict=0.5, fill=False, fill_tol=0.2, max_upscale=1.6, era="any"):
     """Third source: the Art Institute of Chicago's public-domain works (keyless). Strong on
@@ -1489,6 +1492,175 @@ def fetch_artic(count, query, mat_rgb, theme=None, placard=False, describe="off"
                 print(f"  ! skip {o.get('id')}: {str(e)[:120]}", file=sys.stderr)
     return paths
 
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+COMMONS_CATEGORY = "Featured pictures on Wikimedia Commons"   # ~22k curated files, in this one category
+COMMONS_NAME = "Wikimedia Commons"
+COMMONS_META = "ObjectName|Artist|LicenseShortName|ImageDescription|DateTimeOriginal"
+COMMONS_WIDTH = 3840               # a standard thumbnail width; other sizes get rate-limited (HTTP 429)
+COMMONS_PAGE = 50                  # files per API request (the limit when asking for image info)
+
+def _commons_licence_ok(name):
+    """Only licences whose terms a placard can satisfy: CC0 / public domain need nothing, and
+    CC BY / BY-SA need the author and licence named, which the placard does."""
+    n = (name or "").lower().strip()
+    if re.search(r"-(nc|nd)\b", n):                 # NonCommercial / NoDerivatives: not usable here
+        return False
+    return n.startswith(("cc0", "cc by", "public domain", "pd"))
+
+def _commons_text(value):
+    """Commons metadata is HTML fragments (author links, templated descriptions) -> plain text."""
+    return re.sub(r"\s+", " ", _strip_html(value)).strip()
+
+def _commons_author(value):
+    """The credited name. Commons authors are free-form HTML ("This photo was taken by <a>Jo Bloggs</a>.
+    Feel free to use…"); the link text is the actual name, so prefer it and fall back to the plain
+    text, cut at a word boundary."""
+    for m in re.finditer(r"<a\b[^>]*>(.*?)</a>", value or "", flags=re.S):
+        name = _commons_text(m.group(1))
+        if name:
+            return name[:60]
+    text = _commons_text(value)
+    if len(text) > 60:
+        text = text[:60].rsplit(" ", 1)[0] + "…"
+    return "" if text.lower() in ("unknown", "unknown author", "anonymous") else text
+
+def _commons_title(value):
+    """Some files' titles carry Wikidata quick-statement debris ('Name title QS:P1476,en:"Name"
+    label QS:Len,…'); keep what precedes it, and keep every title to a placard-friendly length."""
+    t = _commons_text(value)
+    t = re.split(r"\s+(?:title|label)?\s*QS:", t, maxsplit=1)[0].strip()
+    if len(t) > 110:
+        t = t[:110].rsplit(" ", 1)[0] + "…"
+    return t
+
+def _commons_date(value):
+    """'Taken on 22 July 2018, 17:46:10' -> '22 July 2018'."""
+    t = _commons_text(value)
+    t = re.sub(r"^(taken on|created|date)\s*:?\s*", "", t, flags=re.I)
+    return re.sub(r",?\s*\d{1,2}:\d{2}(:\d{2})?.*$", "", t).strip()
+
+def _commons_piece(page):
+    """One API page -> the fields a placard needs, or None if it isn't usable (not a JPEG, or a
+    licence we can't honour). Kept apart from the network code so it can be tested on its own."""
+    info = (page.get("imageinfo") or [None])[0]
+    if not info or info.get("mime") != "image/jpeg":
+        return None
+    m = {k: (v or {}).get("value", "") for k, v in (info.get("extmetadata") or {}).items()}
+    licence = _commons_text(m.get("LicenseShortName"))
+    if not _commons_licence_ok(licence):
+        return None
+    fname = re.sub(r"\.\w+$", "", (page.get("title") or "").replace("File:", "")).replace("_", " ")
+    title = _commons_title(m.get("ObjectName")) or fname or "Untitled"
+    author = _commons_author(m.get("Artist"))
+    if re.search(r"\.(jpe?g|png|tiff?)$", author, flags=re.I):      # some uploads put the file name here
+        author = ""
+    w, h = info.get("thumbwidth") or info.get("width"), info.get("thumbheight") or info.get("height")
+    return {"title": title, "artist": author, "date": _commons_date(m.get("DateTimeOriginal")),
+            "licence": licence, "description": _commons_text(m.get("ImageDescription")),
+            "page_url": info.get("descriptionurl") or "", "img_url": info.get("thumburl") or info.get("url"),
+            "w": w, "h": h, "id": page.get("pageid")}
+
+def _commons_params(q, prefix=None, offset=0):
+    """Request for one batch of featured files with their image info. A search is restricted to
+    the featured category; with no search we list the category from a random title prefix, since
+    the API can only page forward and this is how we land somewhere random among ~22k files.
+    (Sorting by 'date added' looks tempting but the timestamps are clustered by bulk re-tagging:
+    25 of 30 random dates landed on the same file.)"""
+    p = {"action": "query", "format": "json", "formatversion": "2", "prop": "imageinfo",
+         "iiprop": "url|size|mime|extmetadata", "iiurlwidth": str(COMMONS_WIDTH),
+         "iiextmetadatafilter": COMMONS_META}
+    if q:
+        p.update(generator="search", gsrnamespace="6", gsrlimit=str(COMMONS_PAGE), gsroffset=str(offset),
+                 gsrsearch=f'{q.replace(chr(34), " ")} incategory:"{COMMONS_CATEGORY}"')
+    else:
+        p.update(generator="categorymembers", gcmtitle=f"Category:{COMMONS_CATEGORY}", gcmtype="file",
+                 gcmsort="sortkey", gcmstartsortkeyprefix=prefix or "A", gcmlimit=str(COMMONS_PAGE))
+    return p
+
+def _commons_prefix():
+    """A random two-letter title prefix to start listing from."""
+    return "".join(random.choices(string.ascii_uppercase, k=2))
+
+def _commons_total(q):
+    """How many featured files match a search (to pick a random offset into the results)."""
+    d = met_json(COMMONS_API, params={"action": "query", "format": "json", "formatversion": "2",
+                 "list": "search", "srnamespace": "6", "srlimit": "1", "srinfo": "totalhits",
+                 "srsearch": f'{q.replace(chr(34), " ")} incategory:"{COMMONS_CATEGORY}"'})
+    return ((d.get("query") or {}).get("searchinfo") or {}).get("totalhits") or 0
+
+def fetch_commons(count, query, mat_rgb, theme=None, placard=False, describe="off", types=None, qr=True, tone="whimsical", avoid=None, seasonal=False, hemisphere="north", all_types=True, subject="", holidays=False, weather=False, on_this_day=False, latitude=None, longitude=None, googly_chance=0.0, googly_strict=0.5, fill=False, fill_tol=0.2, max_upscale=1.6, era="any"):
+    """Fourth source: Wikimedia Commons' featured pictures — curated photography (landscapes,
+    wildlife, architecture, space). Keyless; each file carries its own licence, so only CC0,
+    public domain and CC BY / BY-SA are used and the author + licence go on the placard.
+    Genre themes, object types and era are museum ideas and don't apply here; a search term,
+    subject or season/holiday bias does."""
+    os.makedirs(TMP, exist_ok=True); LAST_PIECES.clear()
+    avoid = avoid or set()
+    bias = bias_terms(subject, holidays, seasonal, hemisphere, weather, on_this_day, latitude, longitude)
+    q = query or (random.choice(bias) if bias else None)
+    tw, th = fill_target(placard)
+    if fill:
+        print(f"  fill: {tw}x{th}, " + ("cropping anything to fit" if fill_tol >= 1.0
+              else f"only art that loses under {int(fill_tol*100)}%"))
+    print(f"  commons: {q}" if q else "  commons: featured pictures")
+    total = _commons_total(q) if q else 0
+    if q and not total:
+        return []
+    paths, seen = [], set()
+    for _ in range(1 if q and total <= COMMONS_PAGE else 12):
+        if len(paths) >= count:
+            break
+        taken = 0                                 # a page holds 50 files of near-identical titles, so
+        pages = []                                # take only a few from each: a batch stays varied
+        for _req in range(2 if fill else 1):      # fill mode rejects most shapes: look at more files
+            if q:
+                offset = random.randint(0, max(0, min(total, 1000) - COMMONS_PAGE))
+                pages += met_json(COMMONS_API, params=_commons_params(q, offset=offset)).get("query", {}).get("pages") or []
+            else:
+                pages += met_json(COMMONS_API, params=_commons_params(None, prefix=_commons_prefix())).get("query", {}).get("pages") or []
+        random.shuffle(pages)
+        for pg in pages:
+            if len(paths) >= count or (count > 3 and taken >= 3):
+                break
+            try:
+                if f"wm:{pg.get('pageid')}" in avoid or pg.get("pageid") in seen:
+                    continue
+                seen.add(pg.get("pageid"))
+                c = _commons_piece(pg)
+                if not c or not c["img_url"]:
+                    continue
+                w, h = c["w"], c["h"]
+                if w and h:
+                    if fill and crop_loss(w, h, tw, th) > fill_tol:
+                        continue
+                    if too_small(w, h, placard, fill, max_upscale):
+                        continue
+                r = http_get(c["img_url"])
+                if r is None:
+                    continue
+                art = Image.open(io.BytesIO(r.content)).convert("RGB")
+                if fill and crop_loss(*art.size, tw, th) > fill_tol:
+                    continue
+                if too_small(*art.size, placard, fill, max_upscale):
+                    print(f"  - too small ({art.width}x{art.height}): {c['title'][:40]}")
+                    continue
+                meta = {"title": c["title"], "artist": c["artist"], "bio": "", "date": c["date"],
+                        "medium": "Photograph", "dimensions": "", "culture": "", "objectName": "Photograph",
+                        "culture_period": "", "credit": c["licence"], "museum": COMMONS_NAME}
+                p = os.path.join(TMP, f"{len(paths)+1:02d}_{slug(c['title'])}.jpg")
+                caption_style, caption = _render_piece(art, meta, mat_rgb, p, placard, describe, qr, tone, c["page_url"], real_text=c["description"] or None, googly_chance=googly_chance, googly_strict=googly_strict, fill=fill)
+                paths.append(p)
+                taken += 1
+                LAST_PIECES.append({"title": c["title"], "artist": c["artist"] or "Unknown",
+                                    "url": c["page_url"], "source": COMMONS_NAME, "id": f"wm:{c['id']}",
+                                    "caption_style": caption_style or "", "caption": caption or "",
+                                    "date": c["date"], "medium": "Photograph", "dimensions": "",
+                                    "credit": c["licence"], "culture": ""})
+                print(f"  prepped: {c['title']} — {c['artist'] or 'Unknown'} ({c['licence']})")
+            except Exception as e:
+                print(f"  ! skip {pg.get('pageid')}: {str(e)[:120]}", file=sys.stderr)
+    return paths
+
 def prep_local(files, mat_rgb, googly_chance=0.0, googly_strict=0.5, fill=False):
     os.makedirs(TMP, exist_ok=True)
     out = []
@@ -1529,21 +1701,23 @@ def _roll(chance):
     """True with probability `chance` (0..1) — how a per-run bias mode fires."""
     return random.random() < (chance or 0.0)
 
-SOURCES = ["met", "cleveland", "artic"]
-SOURCE_LABELS = {"met": "the Met", "cleveland": "Cleveland", "artic": "the Art Institute of Chicago"}
+MUSEUMS = ["met", "cleveland", "artic"]          # what --source any rotates through
+SOURCES = MUSEUMS + ["commons"]                  # photographs are opt-in, not part of "any"
+SOURCE_LABELS = {"met": "the Met", "cleveland": "Cleveland", "artic": "the Art Institute of Chicago",
+                 "commons": "Wikimedia Commons"}
 
 def _fetch_source(args, mat_rgb, count, relax=0, src=None):
     """One fetch attempt. relax=0 is exactly as configured; relax>=1 switches the
     season/holiday/weather/on-this-day biases off (a bias term like an obscure
     'on this day' event can easily match nothing at a museum). `src` forces a museum."""
     avoid = {str(x) for x in _load_list(BLOCKLIST)} | {str(h.get("id")) for h in _load_list(HISTORY)[-40:]}
-    src = src or (random.choice(SOURCES) if args.source == "any" else args.source)
+    src = src or (random.choice(MUSEUMS) if args.source == "any" else args.source)
     # Each bias mode is rolled once per run against its configured chance.
     seasonal    = not relax and _roll(args.seasonal_chance)
     holidays    = not relax and _roll(args.holidays_chance)
     weather     = not relax and _roll(args.weather_chance)
     on_this_day = not relax and _roll(args.on_this_day_chance)
-    fetch = {"met": fetch_matted, "cleveland": fetch_cleveland, "artic": fetch_artic}[src]
+    fetch = {"met": fetch_matted, "cleveland": fetch_cleveland, "artic": fetch_artic, "commons": fetch_commons}[src]
     if src == "met":                             # fetch_matted's signature predates the others': all_types sits earlier
         paths = fetch(count, args.query, mat_rgb, args.theme, args.placard, args.all_types,
                       args.describe, args.types, args.qr, args.tone, avoid, seasonal,
@@ -1567,7 +1741,7 @@ def _fetch_with_retries(args, mat_rgb, count):
     if paths:
         return paths
     steps = [("same search again, without season/holiday/weather/on-this-day terms", args, src)]
-    steps += [(f"another museum ({SOURCE_LABELS[o]})", args, o) for o in SOURCES if o != src]
+    steps += [(f"another museum ({SOURCE_LABELS[o]})", args, o) for o in MUSEUMS if o != src]
     if args.query or args.subject or args.theme != "museum":
         loose = argparse.Namespace(**vars(args)); loose.query = None; loose.subject = ""; loose.theme = "museum"
         steps.append(("anything from the whole collection", loose, None))
@@ -1817,7 +1991,7 @@ def main():
     ap.add_argument("--qr", action=argparse.BooleanOptionalAction, default=cfg["qr"],
                     help="show a QR code linking to the real museum page (when a caption is shown)")
     ap.add_argument("--source", choices=SOURCES + ["any"], default=cfg.get("source", "met"),
-                    help="art source: the Met, Cleveland, the Art Institute of Chicago, or a random pick each run")
+                    help="art source: the Met, Cleveland, the Art Institute of Chicago, Wikimedia Commons featured photographs, or a random museum each run")
     ap.add_argument("--era", choices=["any", "modern"], default=cfg.get("era", "any"),
                     help=f"modern: only works finished in {ERA_MODERN_FROM} or later")
     _tone_default = cfg.get("tone") if isinstance(cfg.get("tone"), list) else [cfg.get("tone") or "whimsical"]

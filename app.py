@@ -621,7 +621,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <option value="met">The Met</option>
    <option value="cleveland">Cleveland Museum of Art</option>
    <option value="artic">Art Institute of Chicago</option>
-   <option value="any">Any — a random museum each time</option>
+   <option value="any">Any museum — a random one each time</option>
+   <option value="commons">Wikimedia Commons — featured photographs</option>
  </select>
  <label class="f" style="margin-top:14px">Era <span class="sub">— skew away from antiquities toward newer work</span></label>
  <select id="era">
