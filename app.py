@@ -112,7 +112,7 @@ def save_config(updates):
 def flags_from(cfg):
     """Turn a settings dict into frame_push.py CLI flags (so preview/now match the page)."""
     f = ["--theme", cfg["content"], "--mat", cfg["mat"], "--describe", cfg["description"],
-         "--source", cfg.get("source", "met")]
+         "--source", cfg.get("source", "met"), "--era", cfg.get("era", "any")]
     tones = cfg.get("tone") or ["whimsical"]
     f += ["--tone", ",".join(tones if isinstance(tones, list) else [tones])]
     if cfg.get("tone_weights"):
@@ -620,7 +620,13 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <select id="source">
    <option value="met">The Met</option>
    <option value="cleveland">Cleveland Museum of Art</option>
-   <option value="any">Either — a random pick each time</option>
+   <option value="artic">Art Institute of Chicago</option>
+   <option value="any">Any — a random museum each time</option>
+ </select>
+ <label class="f" style="margin-top:14px">Era <span class="sub">— skew away from antiquities toward newer work</span></label>
+ <select id="era">
+   <option value="any">Any period</option>
+   <option value="modern">Modern — 1850 onward</option>
  </select>
  <label class="f" style="margin-top:16px">Only show art of… <span class="sub">— optional; combines with season/holidays (e.g. cats at Christmas → Christmas cats)</span></label>
  <input type="text" id="subject" placeholder="cats, dogs, dragons… — leave blank for none" style="width:100%;background:#303033;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px">
@@ -717,7 +723,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <script>
 const cfg = {{ cfg|tojson }};
 const $ = id => document.getElementById(id);
-const el = {content:$('content'), source:$('source'), all_types:$('all_types'), typegrid:$('typegrid'),
+const el = {content:$('content'), source:$('source'), era:$('era'), all_types:$('all_types'), typegrid:$('typegrid'),
   placard:$('placard'), captionopts:$('captionopts'), qr:$('qr'), tonerow:$('tonerow'),
   seasonal:$('seasonal'), holidays:$('holidays'), subject:$('subject'), hemisphere:$('hemisphere'),
   weather:$('weather'), on_this_day:$('on_this_day'), googly:$('googly'),
@@ -756,7 +762,7 @@ function syncSched(){const n=Math.max(1,parseInt(el.every.value)||1), u=el.every
 el.every.oninput=syncSched; el.every_unit.onchange=syncSched;
 el.time.value=cfg.time; el.mat.value=cfg.mat; el.mac.value=cfg.mac||''; el.qr.checked=cfg.qr!==false;
 el.time.oninput=syncSched; syncSched();
-el.source.value=cfg.source||'met'; el.ntfy_topic.value=cfg.ntfy_topic||'';
+el.source.value=cfg.source||'met'; el.era.value=cfg.era||'any'; el.ntfy_topic.value=cfg.ntfy_topic||'';
 el.hemisphere.value=cfg.hemisphere||'north'; el.subject.value=cfg.subject||'';
 el.watch_on_fail.checked=cfg.watch_on_fail!==false;
 el.latitude.value=(cfg.latitude!=null?cfg.latitude:''); el.longitude.value=(cfg.longitude!=null?cfg.longitude:'');
@@ -810,7 +816,7 @@ const chosen=new Set(cfg.types||[]);
 document.querySelectorAll('.tcheck').forEach(c=>c.checked=chosen.has(c.dataset.type));
 syncTypes();
 function collect(){return {description:document.querySelector('#description button.on').dataset.v,
-  content:el.content.value, source:el.source.value, all_types:el.all_types.checked,
+  content:el.content.value, source:el.source.value, era:el.era.value, all_types:el.all_types.checked,
   types:[...document.querySelectorAll('.tcheck')].filter(c=>c.checked).map(c=>c.dataset.type),
   qr:el.qr.checked, placard:el.placard.checked,
   tone:[...document.querySelectorAll('#tonegrid .voicerow')].filter(r=>parseFloat(r.dataset.w)>0).map(r=>r.dataset.tone),

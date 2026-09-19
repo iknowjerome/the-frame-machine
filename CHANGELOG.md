@@ -5,6 +5,14 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## [Unreleased]
 
+### Added
+- **Art Institute of Chicago as a third source** (`--source artic`, also part of `any`).
+  Public-domain works only, with the museum's own description as the "real" caption. It was
+  dropped in 2026-06 when its image host began answering 403; the host wants an
+  `AIC-User-Agent` header, which is now sent. Retries fall back through every other museum.
+- **Era filter** (`--era modern`, config `era`, panel "Era"): only works finished in 1850 or
+  later, for all three museums.
+
 ### Fixed
 - **No more blurry blow-ups.** Some museum "original" scans are tiny (one was 750px
   wide) and were being enlarged 4-5x to fill a 4K screen. Any picture that would need

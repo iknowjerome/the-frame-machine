@@ -49,8 +49,11 @@ to the genuine museum page.
   touches art you added yourself.
 - **Web control panel.** A phone-friendly page to pick the content, caption style, how often the
   art changes and when — with **Preview** and **Change now** buttons. No config-file editing.
-- **Two museums.** The Met *and* the Cleveland Museum of Art (both keyless, CC0) — pick one or
-  let it choose either at random. Resilient if one source ever changes.
+- **Three museums.** The Met, the Cleveland Museum of Art and the Art Institute of Chicago (all
+  keyless, public domain) — pick one or let it choose at random. Resilient if one source ever
+  changes. Chicago is the strongest for Impressionist and early-20th-century work.
+- **Era filter.** *Modern (1850 onward)* skews every museum away from antiquities and armour
+  toward paintings, prints and posters of the last 170 years.
 - **Caption voices.** Made-up tales in ~18 tones — whimsical, noir, epic, haiku, limerick,
   conspiracy, pirate, Shakespearean, corporate, Gen-Z, Attenborough, sarcastic, **topical**
   (ties the piece to a real, current news headline), first-person, movie-trailer, tabloid
@@ -146,7 +149,7 @@ When the installer finishes it prints a link — open it on any phone or laptop 
   turns up — **Off / Rarely / Normal / Often** — so you can dial back the ones you don't love
   without losing them entirely. The panel also shows which voice wrote the current caption.
 - **Content:** the whole museum, a single genre, a genre-a-day cycle, or *"only show art of
-  cats"*. Pick the museum (the Met, Cleveland, or either).
+  cats"*. Pick the museum (the Met, Cleveland, Chicago, or any).
 - **Spice modes** — season, holidays, live weather, *on this day*, and googly eyes — each set to
   **Never / Rarely / Sometimes / Always** so they turn up as often (or as rarely) as you like.
 - **Screen fit:** show every piece whole on a mat, or **fill the screen** — only wide,
@@ -177,6 +180,7 @@ Prefer the terminal? `frame_push.py` does everything via flags (they override `c
 ```bash
 python3 frame_push.py --theme museum --describe made-up     # a random piece + a tall tale
 python3 frame_push.py --source cleveland --subject cats     # Cleveland, cats only
+python3 frame_push.py --source artic --era modern           # Art Institute of Chicago, 1850 onward
 python3 frame_push.py --weather                             # match the live local weather
 python3 frame_push.py --on-this-day                        # art tied to a historical event today
 python3 frame_push.py --files a.jpg b.jpg --googly          # push your own images, with googly eyes
@@ -225,7 +229,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.frameart.pli
 
 ## Credits & notes
 
-- Art & metadata: [The Met Collection API](https://metmuseum.github.io/) (Open Access, CC0).
+- Art & metadata: [The Met Collection API](https://metmuseum.github.io/) (Open Access, CC0),
+  the [Cleveland Museum of Art Open Access API](https://openaccess-api.clevelandart.org/) (CC0) and
+  the [Art Institute of Chicago API](https://api.artic.edu/docs/) (public-domain works only; its
+  artwork descriptions are CC-BY 4.0 and shown on the placard credited to the museum).
 - TV control: [samsungtvws](https://github.com/xchwarze/samsung-tv-ws-api).
 - Not affiliated with or endorsed by Samsung, The Metropolitan Museum of Art, or Anthropic.
   "The Frame" is a Samsung trademark. Respect the Met's [Open Access terms](https://www.metmuseum.org/about-the-met/policies-and-documents/open-access).

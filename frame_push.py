@@ -33,9 +33,10 @@ except Exception:
 warnings.filterwarnings("ignore")
 
 CANVAS, MARGIN, JPEG_Q = (3840, 2160), 0.86, 90
+ERA_MODERN_FROM = 1850     # --era modern: only works finished in or after this year
 # Met Museum Collection API — keyless, public-domain, images download cleanly.
-# (Switched off the Art Institute of Chicago in 2026-06: its IIIF image host
-#  started returning 403 to all programmatic requests, even with a browser UA.)
+# (The Art Institute of Chicago is a third source — see AIC_HEADERS for the header its
+#  image host insists on.)
 MET_SEARCH = "https://collectionapi.metmuseum.org/public/collection/v1/search"
 MET_OBJECT = "https://collectionapi.metmuseum.org/public/collection/v1/objects/{id}"
 MET_OBJECTS = "https://collectionapi.metmuseum.org/public/collection/v1/objects"  # every object id
@@ -227,7 +228,7 @@ DEFAULTS = {"mac": "", "ip": None, "description": "made-up", "content": "museum"
             "all_types": True, "types": [], "placard": True, "qr": True, "mat": "charcoal",
             "fetch": 1, "replace": True, "frequency": "daily", "time": "07:30",
             "every": 1, "every_unit": "days",
-            "ntfy_topic": "", "tone": ["whimsical"], "source": "met", "orientation": "landscape",
+            "ntfy_topic": "", "tone": ["whimsical"], "source": "met", "era": "any", "orientation": "landscape",
             "pinned": False, "seasonal": False, "hemisphere": "north",
             "subject": "", "holidays": False, "weather": False, "on_this_day": False,
             "seasonal_chance": 0.0, "holidays_chance": 0.0, "weather_chance": 0.0, "on_this_day_chance": 0.0,
@@ -328,8 +329,8 @@ def http_get(url, params=None, headers=None, tries=4, timeout=30):
         time.sleep(delay); delay *= 2
     return None
 
-def met_json(url, params=None, timeout=30):
-    r = http_get(url, params=params, timeout=timeout)
+def met_json(url, params=None, timeout=30, headers=None):
+    r = http_get(url, params=params, timeout=timeout, headers=headers)
     try:
         return r.json() if r is not None else {}
     except Exception:
@@ -1098,6 +1099,14 @@ def all_object_ids():
         pass
     return ids
 
+MODERN_TERMS = ["painting", "print", "poster", "landscape", "portrait", "still life", "drawing", "photograph"]
+
+def _met_era(params, era):
+    """The Met's search takes a date range only as a begin/end pair."""
+    if era == "modern":
+        return {**params, "dateBegin": ERA_MODERN_FROM, "dateEnd": datetime.date.today().year}
+    return params
+
 def met_size_hint(o):
     """(width, height) in cm from a Met object's measurements, or None. The 'Overall'
     element is the artwork itself (others are frame/mount/sheet); a rough screen for
@@ -1110,7 +1119,7 @@ def met_size_hint(o):
                 return float(m["Width"]), float(m["Height"])
     return None
 
-def fetch_matted(count, query, mat_rgb, theme=None, placard=False, all_types=False, describe="off", types=None, qr=True, tone="whimsical", avoid=None, seasonal=False, hemisphere="north", subject="", holidays=False, weather=False, on_this_day=False, latitude=None, longitude=None, googly_chance=0.0, googly_strict=0.5, fill=False, fill_tol=0.2, max_upscale=1.6):
+def fetch_matted(count, query, mat_rgb, theme=None, placard=False, all_types=False, describe="off", types=None, qr=True, tone="whimsical", avoid=None, seasonal=False, hemisphere="north", subject="", holidays=False, weather=False, on_this_day=False, latitude=None, longitude=None, googly_chance=0.0, googly_strict=0.5, fill=False, fill_tol=0.2, max_upscale=1.6, era="any"):
     os.makedirs(TMP, exist_ok=True)
     LAST_PIECES.clear()
     avoid = avoid or set()
@@ -1126,7 +1135,7 @@ def fetch_matted(count, query, mat_rgb, theme=None, placard=False, all_types=Fal
         require_artists = None
         oids = []
         for kw in bias:
-            hits = met_json(MET_SEARCH, params={"q": kw, "hasImages": "true"}).get("objectIDs") or []
+            hits = met_json(MET_SEARCH, params=_met_era({"q": kw, "hasImages": "true"}, era)).get("objectIDs") or []
             random.shuffle(hits); oids.extend(hits[:60])
         random.shuffle(oids)
     elif theme == "museum" and types and not all_types:
@@ -1137,7 +1146,16 @@ def fetch_matted(count, query, mat_rgb, theme=None, placard=False, all_types=Fal
         require_artists = None
         oids = []
         for kw in (k for t in types for k in TYPE_FILTERS.get(t, ())):
-            hits = met_json(MET_SEARCH, params={"q": kw, "hasImages": "true"}).get("objectIDs") or []
+            hits = met_json(MET_SEARCH, params=_met_era({"q": kw, "hasImages": "true"}, era)).get("objectIDs") or []
+            random.shuffle(hits); oids.extend(hits[:80])
+        random.shuffle(oids)
+    elif theme == "museum" and era == "modern":
+        # 500k random ids are almost all antiquities, so a date-limited "surprise me" has to search.
+        print("  source: whole collection, modern era")
+        require_artists = None
+        oids = []
+        for kw in random.sample(MODERN_TERMS, 4):
+            hits = met_json(MET_SEARCH, params=_met_era({"q": kw, "hasImages": "true"}, era)).get("objectIDs") or []
             random.shuffle(hits); oids.extend(hits[:80])
         random.shuffle(oids)
     elif theme == "museum":
@@ -1149,7 +1167,7 @@ def fetch_matted(count, query, mat_rgb, theme=None, placard=False, all_types=Fal
         terms, require_artists = plan_search(query, theme)
         oids = []
         for q in terms:
-            hits = met_json(MET_SEARCH, params={"q": q, "hasImages": "true"}).get("objectIDs") or []
+            hits = met_json(MET_SEARCH, params=_met_era({"q": q, "hasImages": "true"}, era)).get("objectIDs") or []
             random.shuffle(hits)
             oids.extend(hits[:60])           # cap per term so one term can't dominate
         random.shuffle(oids)
@@ -1165,6 +1183,8 @@ def fetch_matted(count, query, mat_rgb, theme=None, placard=False, all_types=Fal
             o = met_object(oid)
             if not o.get("isPublicDomain"):
                 continue
+            if era == "modern" and (o.get("objectEndDate") or 0) < ERA_MODERN_FROM:
+                continue                         # the date search matches on overlap; recheck
             cls = (o.get("classification") or "").lower()
             if not all_types:
                 if types:
@@ -1214,25 +1234,33 @@ def fetch_matted(count, query, mat_rgb, theme=None, placard=False, all_types=Fal
             print(f"  ! skip {oid}: {str(e)[:120]}", file=sys.stderr)
     return paths
 
+def _pick_query(query, theme, bias):
+    """The one search term a keyword-search museum (Cleveland, Chicago) gets this run: the
+    user's own query, else a bias term, else a term from the chosen genre. None = whole collection."""
+    if query:
+        return query
+    if bias:
+        return random.choice(bias)
+    if theme == "cycle":
+        return random.choice(THEMES[THEME_CYCLE[datetime.date.today().toordinal() % len(THEME_CYCLE)]])
+    if theme in THEMES and theme != "mix":
+        return random.choice(THEMES[theme])
+    if theme == "mix":
+        return random.choice(TERM_POOL)
+    return None
+
 CLE_API = "https://openaccess-api.clevelandart.org/api/artworks/"
 CLE_NAME = "Cleveland Museum of Art"
 
-def fetch_cleveland(count, query, mat_rgb, theme=None, placard=False, describe="off", types=None, qr=True, tone="whimsical", avoid=None, seasonal=False, hemisphere="north", all_types=True, subject="", holidays=False, weather=False, on_this_day=False, latitude=None, longitude=None, googly_chance=0.0, googly_strict=0.5, fill=False, fill_tol=0.2, max_upscale=1.6):
+def fetch_cleveland(count, query, mat_rgb, theme=None, placard=False, describe="off", types=None, qr=True, tone="whimsical", avoid=None, seasonal=False, hemisphere="north", all_types=True, subject="", holidays=False, weather=False, on_this_day=False, latitude=None, longitude=None, googly_chance=0.0, googly_strict=0.5, fill=False, fill_tol=0.2, max_upscale=1.6, era="any"):
     """Second source: Cleveland Museum of Art open access (keyless, CC0). Its API carries
     a real 'description', so 'real' captions need no scraping."""
     os.makedirs(TMP, exist_ok=True); LAST_PIECES.clear()
     avoid = avoid or set()
     params = {"has_image": "1", "cc0": "1", "limit": "100", "indent": "1"}
-    q = query
-    _bias = bias_terms(subject, holidays, seasonal, hemisphere, weather, on_this_day, latitude, longitude)
-    if not q and _bias:
-        q = random.choice(_bias)
-    elif not q and theme == "cycle":
-        q = random.choice(THEMES[THEME_CYCLE[datetime.date.today().toordinal() % len(THEME_CYCLE)]])
-    elif not q and theme in THEMES and theme != "mix":
-        q = random.choice(THEMES[theme])
-    elif not q and theme == "mix":
-        q = random.choice(TERM_POOL)
+    if era == "modern":
+        params["created_after"] = str(ERA_MODERN_FROM)
+    q = _pick_query(query, theme, bias_terms(subject, holidays, seasonal, hemisphere, weather, on_this_day, latitude, longitude))
     tw, th = fill_target(placard)
     if fill:
         print(f"  fill: {tw}x{th}, " + ("cropping anything to fit" if fill_tol >= 1.0
@@ -1316,6 +1344,151 @@ def fetch_cleveland(count, query, mat_rgb, theme=None, placard=False, describe="
             print(f"  ! skip {o.get('id')}: {str(e)[:120]}", file=sys.stderr)
     return paths
 
+AIC_SEARCH = "https://api.artic.edu/api/v1/artworks/search"
+AIC_IMAGE = "https://www.artic.edu/iiif/2/{image_id}/full/{width},/0/default.jpg"
+AIC_PAGE = "https://www.artic.edu/artworks/{id}"
+AIC_NAME = "The Art Institute of Chicago"
+# The museum's image host answers 403 to anything without its documented AIC-User-Agent
+# header (that once got this source dropped); with it, the API and IIIF images work normally.
+AIC_HEADERS = {**HEADERS, "AIC-User-Agent": HEADERS["User-Agent"]}
+AIC_FIELDS = ("id,title,image_id,artist_title,artist_display,date_display,medium_display,dimensions,"
+              "place_of_origin,credit_line,artwork_type_title,description,thumbnail")
+AIC_MAX_SPAN = 50                  # a work may begin at most this many years before the window
+AIC_MAX_PAGES = 10                 # the search API refuses to page past 1,000 results
+AIC_IMAGE_MAX = (3000, 2400)       # longest image we ask for; the TV canvas is 3840x2160
+
+def _aic_params(q, year_from, year_to, page=1, limit=100):
+    """Search params for public-domain works that have an image, optionally limited by the
+    year the work was finished. The API's GET form nests a bool query through bracket keys,
+    and the indexes must run 0,1,2… with no gaps or reordering or it reads them as an object."""
+    clauses = ["[term][is_public_domain]=true", "[exists][field]=image_id"]
+    if year_from:
+        clauses.append(f"[range][date_end][gte]={year_from}")
+        # Records dated "8th century or later" carry date_end 1970, so an end date alone lets
+        # antiquities in. Requiring a start near the window keeps only genuinely dated works.
+        clauses.append(f"[range][date_start][gte]={year_from - AIC_MAX_SPAN}")
+    if year_to:
+        clauses.append(f"[range][date_end][lte]={year_to}")
+    p = {"fields": AIC_FIELDS, "limit": str(limit), "page": str(page)}
+    for i, c in enumerate(clauses):
+        key, value = c.rsplit("=", 1)
+        p[f"query[bool][must][{i}]{key}"] = value
+    if q:
+        p["q"] = q
+    return p
+
+def _aic_window(era, has_query):
+    """(year_from, year_to) for this run. A search keeps the whole range; a whole-collection
+    pick gets a random slice of years, because the API pages only 1,000 deep and would
+    otherwise hand back the same top results on every run."""
+    if has_query:
+        return (ERA_MODERN_FROM if era == "modern" else None), None
+    if era == "modern":
+        lo = random.randrange(ERA_MODERN_FROM, 2000, 10); return lo, lo + 9
+    lo = random.randrange(1300, 2000, 25); return lo, lo + 24
+
+def _aic_image_url(image_id, w, h):
+    """IIIF URL sized to what the canvas can use. Never asks for more than the original:
+    the server errors rather than upscaling."""
+    if w and h:
+        width = max(1, int(w * min(1.0, AIC_IMAGE_MAX[0] / w, AIC_IMAGE_MAX[1] / h)))
+    else:
+        width = 1686
+    return AIC_IMAGE.format(image_id=image_id, width=width)
+
+def _aic_artist(o):
+    """(name, bio) from the API's 'Name (Nationality, 1840–1926)\\nmore lines' display string."""
+    name = o.get("artist_title") or ""
+    first = (o.get("artist_display") or "").split("\n")[0]
+    bio = first[first.find("(") + 1:first.rfind(")")].strip() if "(" in first and ")" in first else ""
+    return name, bio
+
+def _strip_html(text):
+    return html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+
+def fetch_artic(count, query, mat_rgb, theme=None, placard=False, describe="off", types=None, qr=True, tone="whimsical", avoid=None, seasonal=False, hemisphere="north", all_types=True, subject="", holidays=False, weather=False, on_this_day=False, latitude=None, longitude=None, googly_chance=0.0, googly_strict=0.5, fill=False, fill_tol=0.2, max_upscale=1.6, era="any"):
+    """Third source: the Art Institute of Chicago's public-domain works (keyless). Strong on
+    Impressionism and early-20th-century art. Its API carries a real 'description'."""
+    os.makedirs(TMP, exist_ok=True); LAST_PIECES.clear()
+    avoid = avoid or set()
+    q = _pick_query(query, theme, bias_terms(subject, holidays, seasonal, hemisphere, weather, on_this_day, latitude, longitude))
+    tw, th = fill_target(placard)
+    if fill:
+        print(f"  fill: {tw}x{th}, " + ("cropping anything to fit" if fill_tol >= 1.0
+              else f"only art that loses under {int(fill_tol*100)}%"))
+    print(f"  artic: {q}" if q else "  artic: whole collection")
+    paths, seen = [], set()
+    # A search is one fixed query; a whole-collection pick samples a fresh year-slice each round,
+    # so a strict filter (paintings only, fill the screen) can still reach `count` instead of
+    # stopping at whatever one thin slice happened to hold.
+    for _ in range(1 if q else 8):
+        if len(paths) >= count:
+            break
+        lo, hi = _aic_window(era, bool(q))
+        pg = (met_json(AIC_SEARCH, params=_aic_params(q, lo, hi, limit=1), headers=AIC_HEADERS).get("pagination") or {})
+        total = pg.get("total") or 0
+        if not total:
+            continue
+        if hi:
+            print(f"  artic: finished {lo}–{hi}")
+        elif lo:
+            print(f"  artic: finished {lo} or later")
+        pages = min(AIC_MAX_PAGES, -(-total // 100))
+        data = []
+        for page in random.sample(range(1, pages + 1), k=min(pages, 3 if fill else 1)):
+            data += met_json(AIC_SEARCH, params=_aic_params(q, lo, hi, page=page), headers=AIC_HEADERS).get("data") or []
+        random.shuffle(data)
+        for o in data:
+            if len(paths) >= count:
+                break
+            try:
+                if not o.get("image_id") or f"aic:{o.get('id')}" in avoid or o.get("id") in seen:
+                    continue
+                seen.add(o.get("id"))                # slices are drawn at random and can repeat
+                typ = (o.get("artwork_type_title") or "").lower()
+                if not all_types:
+                    allowed = tuple(k for t in types for k in TYPE_FILTERS.get(t, ())) if types else CLASS_OK
+                    if not any(k in typ for k in allowed):
+                        continue
+                thumb = o.get("thumbnail") or {}     # its width/height are the original image's pixels
+                w, h = thumb.get("width"), thumb.get("height")
+                if w and h:
+                    if fill and crop_loss(w, h, tw, th) > fill_tol:
+                        continue
+                    if too_small(w, h, placard, fill, max_upscale):
+                        continue
+                name, bio = _aic_artist(o)
+                origin = o.get("place_of_origin") or ""
+                meta = {"title": o.get("title") or "Untitled", "artist": name, "bio": bio,
+                        "date": o.get("date_display"), "medium": o.get("medium_display"),
+                        "dimensions": (o.get("dimensions") or "").split("\n")[0].strip(),
+                        "culture": origin, "objectName": o.get("artwork_type_title"),
+                        "culture_period": "" if name else origin,
+                        "credit": o.get("credit_line"), "museum": AIC_NAME}
+                r = http_get(_aic_image_url(o["image_id"], w, h), headers=AIC_HEADERS)
+                if r is None:
+                    continue
+                art = Image.open(io.BytesIO(r.content)).convert("RGB")
+                if fill and crop_loss(*art.size, tw, th) > fill_tol:
+                    continue
+                if too_small(*art.size, placard, fill, max_upscale):
+                    print(f"  - too small ({art.width}x{art.height}): {meta['title'][:40]}")
+                    continue
+                page_url = AIC_PAGE.format(id=o["id"])
+                p = os.path.join(TMP, f"{len(paths)+1:02d}_{slug(meta['title'])}.jpg")
+                caption_style, caption = _render_piece(art, meta, mat_rgb, p, placard, describe, qr, tone, page_url, real_text=_strip_html(o.get("description")).strip() or None, googly_chance=googly_chance, googly_strict=googly_strict, fill=fill)
+                paths.append(p)
+                LAST_PIECES.append({"title": meta["title"], "artist": name or origin or "Unknown",
+                                    "url": page_url, "source": AIC_NAME, "id": f"aic:{o['id']}",
+                                    "caption_style": caption_style or "", "caption": caption or "",
+                                    "date": meta.get("date") or "", "medium": meta.get("medium") or "",
+                                    "dimensions": meta.get("dimensions") or "", "credit": meta.get("credit") or "",
+                                    "culture": meta.get("culture_period") or meta.get("culture") or ""})
+                print(f"  prepped: {meta['title']} — {name or origin or 'Unknown'}")
+            except Exception as e:
+                print(f"  ! skip {o.get('id')}: {str(e)[:120]}", file=sys.stderr)
+    return paths
+
 def prep_local(files, mat_rgb, googly_chance=0.0, googly_strict=0.5, fill=False):
     os.makedirs(TMP, exist_ok=True)
     out = []
@@ -1356,29 +1529,33 @@ def _roll(chance):
     """True with probability `chance` (0..1) — how a per-run bias mode fires."""
     return random.random() < (chance or 0.0)
 
+SOURCES = ["met", "cleveland", "artic"]
+SOURCE_LABELS = {"met": "the Met", "cleveland": "Cleveland", "artic": "the Art Institute of Chicago"}
+
 def _fetch_source(args, mat_rgb, count, relax=0, src=None):
     """One fetch attempt. relax=0 is exactly as configured; relax>=1 switches the
     season/holiday/weather/on-this-day biases off (a bias term like an obscure
     'on this day' event can easily match nothing at a museum). `src` forces a museum."""
     avoid = {str(x) for x in _load_list(BLOCKLIST)} | {str(h.get("id")) for h in _load_list(HISTORY)[-40:]}
-    src = src or (random.choice(["met", "cleveland"]) if args.source == "any" else args.source)
+    src = src or (random.choice(SOURCES) if args.source == "any" else args.source)
     # Each bias mode is rolled once per run against its configured chance.
     seasonal    = not relax and _roll(args.seasonal_chance)
     holidays    = not relax and _roll(args.holidays_chance)
     weather     = not relax and _roll(args.weather_chance)
     on_this_day = not relax and _roll(args.on_this_day_chance)
-    if src == "cleveland":
-        paths = fetch_cleveland(count, args.query, mat_rgb, args.theme, args.placard,
-                                args.describe, args.types, args.qr, args.tone, avoid,
-                                seasonal, args.hemisphere, args.all_types, args.subject, holidays,
-                                weather, on_this_day, args.latitude, args.longitude, args.googly_chance,
-                                args.googly_strict, args.fill, args.fill_tolerance, args.max_upscale)
+    fetch = {"met": fetch_matted, "cleveland": fetch_cleveland, "artic": fetch_artic}[src]
+    if src == "met":                             # fetch_matted's signature predates the others': all_types sits earlier
+        paths = fetch(count, args.query, mat_rgb, args.theme, args.placard, args.all_types,
+                      args.describe, args.types, args.qr, args.tone, avoid, seasonal,
+                      args.hemisphere, args.subject, holidays,
+                      weather, on_this_day, args.latitude, args.longitude, args.googly_chance,
+                      args.googly_strict, args.fill, args.fill_tolerance, args.max_upscale, args.era)
     else:
-        paths = fetch_matted(count, args.query, mat_rgb, args.theme, args.placard, args.all_types,
-                             args.describe, args.types, args.qr, args.tone, avoid, seasonal,
-                             args.hemisphere, args.subject, holidays,
-                             weather, on_this_day, args.latitude, args.longitude, args.googly_chance,
-                             args.googly_strict, args.fill, args.fill_tolerance, args.max_upscale)
+        paths = fetch(count, args.query, mat_rgb, args.theme, args.placard,
+                      args.describe, args.types, args.qr, args.tone, avoid,
+                      seasonal, args.hemisphere, args.all_types, args.subject, holidays,
+                      weather, on_this_day, args.latitude, args.longitude, args.googly_chance,
+                      args.googly_strict, args.fill, args.fill_tolerance, args.max_upscale, args.era)
     return paths, src
 
 def _fetch_with_retries(args, mat_rgb, count):
@@ -1389,9 +1566,8 @@ def _fetch_with_retries(args, mat_rgb, count):
     paths, src = _fetch_source(args, mat_rgb, count)
     if paths:
         return paths
-    other = "met" if src == "cleveland" else "cleveland"
-    steps = [("same search again, without season/holiday/weather/on-this-day terms", args, src),
-             (f"the other museum ({'the Met' if other == 'met' else 'Cleveland'})", args, other)]
+    steps = [("same search again, without season/holiday/weather/on-this-day terms", args, src)]
+    steps += [(f"another museum ({SOURCE_LABELS[o]})", args, o) for o in SOURCES if o != src]
     if args.query or args.subject or args.theme != "museum":
         loose = argparse.Namespace(**vars(args)); loose.query = None; loose.subject = ""; loose.theme = "museum"
         steps.append(("anything from the whole collection", loose, None))
@@ -1413,12 +1589,13 @@ def _gather(args, mat_rgb, count):
     'change now' (--force) always fetch fresh; only automatic runs re-show favourites."""
     if args.files:
         return prep_local(args.files, mat_rgb, args.googly_chance, args.googly_strict, args.fill)
-    if not args.preview and not args.force and random.random() < FAV_CHANCE:
+    previewing = args.preview or getattr(args, "preview_dir", None)   # both must show exactly what was asked for
+    if not previewing and not args.force and random.random() < FAV_CHANCE:
         fav = favourite_pick()
         if fav:
             print("  ★ reshowing a favourite"); return [fav]
     paths = _fetch_with_retries(args, mat_rgb, count)
-    if not paths and not args.preview:         # couldn't get new art -> fall back to a favourite
+    if not paths and not previewing:           # couldn't get new art -> fall back to a favourite
         fav = favourite_pick()
         if fav:
             print("  ★ no fresh art — reshowing a favourite"); return [fav]
@@ -1639,8 +1816,10 @@ def main():
                     help="caption: off, the Met's real prose, or an invented tale (needs a key)")
     ap.add_argument("--qr", action=argparse.BooleanOptionalAction, default=cfg["qr"],
                     help="show a QR code linking to the real museum page (when a caption is shown)")
-    ap.add_argument("--source", choices=["met", "cleveland", "any"], default=cfg.get("source", "met"),
-                    help="art source: the Met, the Cleveland Museum, or a random pick each run")
+    ap.add_argument("--source", choices=SOURCES + ["any"], default=cfg.get("source", "met"),
+                    help="art source: the Met, Cleveland, the Art Institute of Chicago, or a random pick each run")
+    ap.add_argument("--era", choices=["any", "modern"], default=cfg.get("era", "any"),
+                    help=f"modern: only works finished in {ERA_MODERN_FROM} or later")
     _tone_default = cfg.get("tone") if isinstance(cfg.get("tone"), list) else [cfg.get("tone") or "whimsical"]
     ap.add_argument("--tone", default=_tone_default,
                     type=lambda s: [x.strip() for x in s.split(",") if x.strip() in TONES],

@@ -1220,6 +1220,92 @@ class TestFlagsFrom(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
 
 
+class TestArtInstituteOfChicago(unittest.TestCase):
+    """The third source. Its image host 403s without the AIC-User-Agent header (which is why
+    it was once dropped), and its search API refuses to page past 1,000 results."""
+
+    def test_requests_carry_the_header_its_image_host_insists_on(self):
+        self.assertIn("AIC-User-Agent", fp.AIC_HEADERS)
+        self.assertIn("User-Agent", fp.AIC_HEADERS)
+
+    def test_search_params_are_public_domain_with_an_image(self):
+        p = fp._aic_params("Monet", None, None, page=3)
+        self.assertEqual(p["query[bool][must][0][term][is_public_domain]"], "true")
+        self.assertEqual(p["query[bool][must][1][exists][field]"], "image_id")
+        self.assertEqual((p["q"], p["page"]), ("Monet", "3"))
+        self.assertFalse(any("range" in k for k in p), "no date range unless one was asked for")
+
+    def _clause_indexes(self, p):
+        import re
+        return [int(m.group(1)) for k in p for m in [re.match(r"query\[bool\]\[must\]\[(\d+)\]", k)] if m]
+
+    def test_search_params_limit_the_years_when_asked(self):
+        p = fp._aic_params(None, 1900, 1909)
+        self.assertEqual(p["query[bool][must][2][range][date_end][gte]"], "1900")
+        self.assertEqual(p["query[bool][must][4][range][date_end][lte]"], "1909")
+        self.assertNotIn("q", p)
+        # "8th century or later" records have date_end 1970; the start bound keeps them out
+        self.assertEqual(p["query[bool][must][3][range][date_start][gte]"], str(1900 - fp.AIC_MAX_SPAN))
+
+    def test_clause_indexes_are_gapless_and_in_order(self):
+        """Bug caught live: with no upper year the indexes skipped one, and the API answered
+        400 (it reads non-sequential indexes as an object, not a list)."""
+        for args in [(None, None, None), ("x", None, None), (None, 1850, None), (None, 1900, 1909), ("x", 1850, None)]:
+            with self.subTest(args=args):
+                idx = self._clause_indexes(fp._aic_params(*args))
+                self.assertEqual(idx, list(range(len(idx))))
+
+    def test_a_whole_collection_pick_gets_a_year_slice_so_it_isnt_the_same_1000_forever(self):
+        for _ in range(50):
+            lo, hi = fp._aic_window("any", has_query=False)
+            self.assertEqual(hi - lo, 24)
+            lo, hi = fp._aic_window("modern", has_query=False)
+            self.assertGreaterEqual(lo, fp.ERA_MODERN_FROM)
+            self.assertEqual(hi - lo, 9)
+
+    def test_a_search_keeps_the_whole_range_unless_the_era_limits_it(self):
+        self.assertEqual(fp._aic_window("any", has_query=True), (None, None))
+        self.assertEqual(fp._aic_window("modern", has_query=True), (fp.ERA_MODERN_FROM, None))
+
+    def test_image_width_never_exceeds_the_original(self):
+        self.assertIn("/full/500,/", fp._aic_image_url("abc", 500, 400))      # small: not upscaled
+        self.assertIn("/full/3000,/", fp._aic_image_url("abc", 6000, 4000))   # big landscape: capped
+        # a tall original is capped by height (2400), so its width lands below 3000
+        self.assertIn("/full/1500,/", fp._aic_image_url("abc", 3000, 4800))
+        self.assertIn("/full/1686,/", fp._aic_image_url("abc", None, None))   # size unknown: a safe default
+
+    def test_artist_and_bio_come_from_the_display_string(self):
+        self.assertEqual(fp._aic_artist({"artist_title": "Georges Seurat",
+                                         "artist_display": "Georges Seurat (French, 1859–1891)"}),
+                         ("Georges Seurat", "French, 1859–1891"))
+        self.assertEqual(fp._aic_artist({"artist_title": "Olowe of Ise",
+                                         "artist_display": "Olowe of Ise (died 1938)\nYòrùbá: Èkìtì"}),
+                         ("Olowe of Ise", "died 1938"))
+        self.assertEqual(fp._aic_artist({"artist_title": None, "artist_display": None}), ("", ""))
+
+    def test_descriptions_arrive_as_html_and_leave_as_text(self):
+        self.assertEqual(fp._strip_html("<p>In <em>Ferris</em> &amp; friends.</p>").split(), ["In", "Ferris", "&", "friends."])
+        self.assertEqual(fp._strip_html(None), "")
+
+    def test_any_source_includes_it_and_every_source_has_a_label(self):
+        self.assertIn("artic", fp.SOURCES)
+        self.assertEqual(set(fp.SOURCES), set(fp.SOURCE_LABELS))
+
+
+class TestEraFilter(unittest.TestCase):
+    def test_the_met_search_gets_a_date_pair_only_for_modern(self):
+        base = {"q": "landscape", "hasImages": "true"}
+        self.assertEqual(fp._met_era(base, "any"), base)
+        out = fp._met_era(base, "modern")
+        self.assertEqual(out["dateBegin"], fp.ERA_MODERN_FROM)
+        self.assertGreaterEqual(out["dateEnd"], 2025)
+        self.assertNotIn("dateBegin", base, "the caller's dict must not be mutated")
+
+    def test_the_panel_sends_era_and_the_pusher_accepts_it(self):
+        flags = app.flags_from(dict(fp.DEFAULTS, mac="a0:d0:5b:01:23:56", era="modern"))
+        self.assertEqual(flags[flags.index("--era") + 1], "modern")
+
+
 class TestShippedExamples(unittest.TestCase):
     """Bug: both shipped scheduling examples passed --describe with no value."""
 
